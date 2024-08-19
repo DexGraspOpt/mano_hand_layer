@@ -1,18 +1,14 @@
-# leap_hand layer for torch
+# mano hand layer for torch
 import torch
 import trimesh
 import os
 import numpy as np
-import copy
-from manotorch.anchorlayer import AnchorLayer
+# import copy
+# from manotorch.anchorlayer import AnchorLayer
 from manotorch.axislayer import AxisLayerFK
+from manotorch.anatomy_loss import AnatomyConstraintLossEE
 from manotorch.manolayer import ManoLayer, MANOOutput
-import pytorch3d
 
-
-# import sys
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-# from layer_asset_utils import save_part_mesh, sample_points_on_mesh, sample_visible_points
 
 # All lengths are in mm and rotations in radians
 
@@ -50,15 +46,36 @@ class ManoHandLayer(torch.nn.Module):
         self.hand_type = hand_type
         self.finger_num = 5
 
-        self.joints_lower = torch.tensor([-1.57]*45).to(self.device)
-        self.joints_upper = torch.tensor([1.57]*45).to(self.device)
+        # self.initial_ = torch.tensor([0]*45).to(self.device)
+        #
+        # self.final_ = torch.tensor([-0.08, -0.44,  1.52, 0.0, 0.0, 1.2, 0.0, 0.0, 1.2,  # index
+        #                             0.0, 0.0, 1.49, 0.0, 0.4, 1.2, 0.0, 0.4, 1.2,  # middle
+        #                             -0.62, 0.03, 1.05, 0.0, 0.0, 1.2, 0.0, 1.0, 1.0,  # little
+        #                             0.15, 0.38, 1.51, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,  # ring
+        #                             1.2, -0.4, 0.25, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0,  # thumb
+        #                             ]).to(self.device)
+        # self.joints_lower = torch.min(self.initial_, self.final_) - 0.05
+        # self.joints_upper = torch.max(self.initial_, self.final_) + 0.05
+        self.joints_lower = -1.5 * torch.ones(45, dtype=torch.float, device=self.device)
+        self.joints_upper = 1.5 * torch.ones(45, dtype=torch.float, device=self.device)
+        self.n_dofs = 45
+        # self.n_dofs = 25  # ncomps
+        # self.joints_lower = -3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+        # self.joints_upper = 3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+
         self.joints_mean = (self.joints_lower + self.joints_upper) / 2
         self.joints_range = self.joints_mean - self.joints_lower
-        self.n_dofs = 45
+
         if to_mano_frame:
-            self.chain = ManoLayer(use_pca=False, center_idx=9).to(self.device)
+            # self.chain = ManoLayer(use_pca=True, center_idx=9, ncomps=self.n_dofs, flat_hand_mean=False).to(self.device)
+            self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
         else:
-            self.chain = ManoLayer(use_pca=False, center_idx=0).to(self.device)
+            # self.chain = ManoLayer(use_pca=True, center_idx=0, ncomps=self.n_dofs, flat_hand_mean=False).to(self.device)
+            self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
+
+        self.axisFK = AxisLayerFK().to(device)
+        self.anatomyLoss = AnatomyConstraintLossEE(reduction='none')
+        self.anatomyLoss.setup()
 
         self.load_asset()
 
@@ -97,6 +114,7 @@ class ManoHandLayer(torch.nn.Module):
         return hand_segment_indices, hand_finger_indices
 
     def recover_points_batch(self, vertices):
+        # following code are partial adopt from manotorch: https://github.com/lixiny/manotorch
         # vertices = TENSOR[NBATCH, 778, 3]
         # face_vert_idx = TENSOR[1, 32, 3]
         # point_coord = TENSOR[1, 32, 3]
@@ -128,22 +146,29 @@ class ManoHandLayer(torch.nn.Module):
         return ret
 
     def compute_abnormal_joint_loss(self, theta):
-        loss_1 = torch.clamp(theta[:, 0] - theta[:, 4], 0, 1) * 10
-        loss_2 = torch.clamp(theta[:, 4] + theta[:, 8], 0, 1) * 10
-        loss_3 = -torch.clamp(theta[:, 8] - theta[:, 13], -1, 0) * 10
-        loss_4 = torch.abs(theta[:, 12]) * 5
-        loss_5 = torch.abs(theta[:, [2, 3, 6, 7, 10, 11,  15, 16]] - self.joints_mean[[2, 3, 6, 7, 10, 11, 15, 16]].unsqueeze(0)).sum(dim=-1) * 2
-        return loss_1 + loss_2 + loss_3 + loss_4 + loss_5
+        # this loss is borrowed from manotorch https://github.com/lixiny/manotorch
+        T_g_p = self.transforms_abs  # (B, 16, 4, 4)
+        T_g_a, R, ee = self.axisFK(T_g_p)  # ee (B, 16, 3)
+
+        loss = self.anatomyLoss(ee).sum(dim=-1) * 8.0
+        return loss
 
     def get_init_angle(self):
-        init_angle = torch.tensor([-0.15, 0, 0.6, 0, 0, 0, 0.6, 0, -0.15, 0, 0.6, 0, 0, -0.25, 0, 0.6, 0,
-                                        0, 1.2, 0, 0.0, 0], dtype=torch.float, device=self.device)
+        # init_angle = torch.tensor([1.4652, -0.3323, -0.0870,  0.7658, -0.2669, -0.4410,  0.3247, -0.0949, -0.7999,
+        #                            -0.6839, -0.8696, -0.3359, -1.2978,  0.6732, -1.0504, -1.1258, 1.1044, -0.2957,
+        #                            0.6644,  2.4779, -2.1917,  0.2846, -1.3454, -2.0336, 3.0933],
+        #                           dtype=torch.float, device=self.device)
+        # init_angle = torch.tensor([1.4821, -0.4207, -0.0099,  0.9950, -0.1108, -0.0120,  0.2900, -0.2656,
+        #  -0.2779, -0.4557, -0.6208, -0.6137, -0.6571,  0.9211, -0.4979, -0.2437,
+        #   2.2343,  0.1720, -0.2148,  1.7550], dtype=torch.float32, device=self.device)
+        init_angle = torch.zeros(self.n_dofs, dtype=torch.float, device=self.device)
+        init_angle[36:39] = torch.tensor([1.2, 0.4, 0.2])
         return init_angle
 
     def get_hand_mesh(self, pose, ret):
         bs = pose.shape[0]
 
-        output_verts = (pose[:, :3, :3] @ ret.verts.transpose(1, 2)).transpose(1, 2) + pose[:, :3, 3]
+        output_verts = (pose[:, :3, :3] @ ret.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
         hand_meshes = []
         for idx in range(bs):
             verts = output_verts[idx]
@@ -166,14 +191,15 @@ class ManoHandLayer(torch.nn.Module):
     def get_forward_vertices(self, pose, theta):
         theta_all = torch.cat([self.zero_root.repeat(theta.shape[0], 1), theta], dim=1)
         outputs = self.forward(theta_all)
-
-        verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2)).transpose(1, 2) + pose[:, :3, 3]
+        self.transforms_abs = outputs.transforms_abs
+        verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
         points, normals = self.recover_points_batch(verts)
 
         return points, normals
 
 
 class ManoAnchor(torch.nn.Module):
+    # anchor positions are partial followed CPF ICCV_2021 https://github.com/lixiny/CPF
     def __init__(self):
         super().__init__()
         # vert_idx
@@ -234,6 +260,25 @@ class ManoAnchor(torch.nn.Module):
 
 
 if __name__ == "__main__":
+    # # FINGER LIMIT ANGLE FOR RIGHT HAND:
+    # limit_bigfinger_right = torch.FloatTensor([1.2, -0.4, 0.25])  # 36:39
+    # limit_index_right = torch.FloatTensor([-0.0827, -0.4389, 1.5193])  # 0:3
+    # limit_middlefinger_right = torch.FloatTensor([-2.9802e-08, -7.4506e-09, 1.4932e+00])  # 9:12
+    # limit_fourth_right = torch.FloatTensor([0.1505, 0.3769, 1.5090])  # 27:30
+    # limit_small_right = torch.FloatTensor([-0.6235, 0.0275, 1.0519])  # 18:21
+    #
+    # limit_secondjoint_bigfinger_right = torch.FloatTensor([0.0, -1.0, 0.0])
+    # limit_secondjoint_index_right = torch.FloatTensor([0.0, 0.0, 1.2])
+    # limit_secondjoint_middlefinger_right = torch.FloatTensor([0.0, 0.4, 1.2])
+    # limit_secondjoint_fourth_right = torch.FloatTensor([0.0, 1.0, 1.0])
+    # limit_secondjoint_small_right = torch.FloatTensor([0.0, 0.0, 1.2])
+    #
+    # limit_thirdjoint_bigfinger_right = torch.FloatTensor([0.0, -1.0, 0.0])
+    # limit_thirdjoint_index_right = torch.FloatTensor([0.0, 0.0, 1.2])
+    # limit_thirdjoint_middlefinger_right = torch.FloatTensor([0.0, 0.4, 1.2])
+    # limit_thirdjoint_fourth_right = torch.FloatTensor([0.0, 1.0, 1.0])
+    # limit_thirdjoint_small_right = torch.FloatTensor([0.0, 0.0, 1.2])
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     show_mesh = False
@@ -244,7 +289,8 @@ if __name__ == "__main__":
     theta = np.zeros((1, hand.n_dofs), dtype=np.float32)
     # theta[0, 12:17] = np.array([-0.5, 0.5, 0, 0, 0])
     theta = torch.from_numpy(theta).to(device)
-    # theta[:, 9:12] = torch.FloatTensor([-2.9802e-08, -7.4506e-09, 1.4932e+00])
+    theta[:, 36:39] = torch.FloatTensor([1.2, 0.4, 0.2])
+    # theta[:, 18:27] = torch.FloatTensor([-0.0,  0.0,  0.0, 0, 1.0, 1.0, 0, 1.5, 1.0])
     # limit_middlefinger_right = torch.FloatTensor([-2.9802e-08, -7.4506e-09, 1.4932e+00])  # 9:12
     # print(hand.joints_lower)
     # print(hand.joints_upper)
@@ -270,7 +316,8 @@ if __name__ == "__main__":
             pc_list.append(pc_tmp)
 
         ray_visualize = trimesh.load_path(np.hstack((verts[0].detach().cpu().numpy(),
-                                                     verts[0].detach().cpu().numpy() + normals[0].detach().cpu().numpy() * 0.01)).reshape(-1, 2, 3))
+                                                     verts[0].detach().cpu().numpy() +
+                                                     normals[0].detach().cpu().numpy() * 0.01)).reshape(-1, 2, 3))
 
         mesh = trimesh.load(os.path.join(hand.BASE_DIR, '../assets/hand_to_mano_frame.obj'))
 
