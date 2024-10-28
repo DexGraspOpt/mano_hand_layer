@@ -8,6 +8,7 @@ import numpy as np
 from manotorch.axislayer import AxisLayerFK
 from manotorch.anatomy_loss import AnatomyConstraintLossEE
 from manotorch.manolayer import ManoLayer, MANOOutput
+import roma
 
 
 # All lengths are in mm and rotations in radians
@@ -35,9 +36,9 @@ def compute_vertex_normals_wpalfi(meshes):
 
 
 class ManoHandLayer(torch.nn.Module):
-    def __init__(self, to_mano_frame=True, show_mesh=False, hand_type='right', device='cuda'):
+    def __init__(self, to_mano_frame=True, show_mesh=False, use_pca=True, flat_hand_mean=False, hand_type='right', device='cuda'):
         super().__init__()
-        assert to_mano_frame==True
+        # assert to_mano_frame==True
         self.BASE_DIR = os.path.split(os.path.abspath(__file__))[0]
         self.show_mesh = show_mesh
         self.to_mano_frame = to_mano_frame
@@ -45,6 +46,8 @@ class ManoHandLayer(torch.nn.Module):
         self.name = 'mano_hand'
         self.hand_type = hand_type
         self.finger_num = 5
+        self.use_pca = use_pca
+        self.flat_hand_mean = flat_hand_mean
 
         # self.initial_ = torch.tensor([0]*45).to(self.device)
         #
@@ -56,22 +59,40 @@ class ManoHandLayer(torch.nn.Module):
         #                             ]).to(self.device)
         # self.joints_lower = torch.min(self.initial_, self.final_) - 0.05
         # self.joints_upper = torch.max(self.initial_, self.final_) + 0.05
-        self.joints_lower = -1.5 * torch.ones(45, dtype=torch.float, device=self.device)
-        self.joints_upper = 1.5 * torch.ones(45, dtype=torch.float, device=self.device)
-        self.n_dofs = 45
-        # self.n_dofs = 25  # ncomps
-        # self.joints_lower = -3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
-        # self.joints_upper = 3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+        # self.joints_lower = -1.5 * torch.ones(45, dtype=torch.float, device=self.device)
+        # self.joints_upper = 1.5 * torch.ones(45, dtype=torch.float, device=self.device)
+        # self.n_dofs = 45
+        if use_pca:
+            self.n_dofs = 25  # ncomps
+            if to_mano_frame:
+                self.chain = ManoLayer(use_pca=True, center_idx=9, ncomps=self.n_dofs, flat_hand_mean=False).to(
+                    self.device)
+                # self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
+            else:
+                self.chain = ManoLayer(use_pca=True, center_idx=0, ncomps=self.n_dofs, flat_hand_mean=False).to(
+                    self.device)
+                # self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
 
-        self.joints_mean = (self.joints_lower + self.joints_upper) / 2
-        self.joints_range = self.joints_mean - self.joints_lower
+            self.joints_lower = -3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+            self.joints_upper = 3 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
 
-        if to_mano_frame:
-            # self.chain = ManoLayer(use_pca=True, center_idx=9, ncomps=self.n_dofs, flat_hand_mean=False).to(self.device)
-            self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
+            self.joints_mean = (self.joints_lower + self.joints_upper) / 2
+            self.joints_range = self.joints_mean - self.joints_lower
         else:
-            # self.chain = ManoLayer(use_pca=True, center_idx=0, ncomps=self.n_dofs, flat_hand_mean=False).to(self.device)
-            self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
+            self.n_dofs = 45
+            if to_mano_frame:
+                self.chain = ManoLayer(use_pca=False, center_idx=9, flat_hand_mean=False).to(
+                    self.device)
+                # self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
+            else:
+                self.chain = ManoLayer(use_pca=False, center_idx=0, flat_hand_mean=False).to(
+                    self.device)
+                # self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
+            self.joints_lower = -2 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+            self.joints_upper = 2 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
+
+            self.joints_mean = (self.joints_lower + self.joints_upper) / 2
+            self.joints_range = self.joints_mean - self.joints_lower
 
         self.axisFK = AxisLayerFK().to(device)
         self.anatomyLoss = AnatomyConstraintLossEE(reduction='none')
@@ -86,6 +107,11 @@ class ManoHandLayer(torch.nn.Module):
         self.zero_root = torch.zeros((1, 3), device=self.device)
 
         self.hand_segment_indices, self.hand_finger_indices = self.get_hand_segment_indices()
+
+        self.lTm = torch.eye(4).reshape(1, 4, 4).to(self.device)
+        self.lTm[:, :3, :3] = torch.tensor([[0.00, 0.00, -1.00],
+                                           [-1.00, 0.00, 0.00],
+                                           [0.00, 1.00, 0.00]])
 
     def load_asset(self):
         assert_dir = os.path.dirname(os.path.realpath(__file__)) + "/../assets/"
@@ -107,10 +133,10 @@ class ManoHandLayer(torch.nn.Module):
         # TODO: hand segment idx for mano hand will be released in the next version
         hand_segment_indices = {}
         hand_finger_indices = {}
-        for finger_name in ['palm', 'thumb', 'index', 'middle', 'ring', 'little']:
-            idx_path = os.path.join(assert_dir, "finger_point_idx/{}.txt".format(finger_name))
+        for finger in ['palm', 'thumb', 'index', 'middle', 'ring', 'little']:
+            idx_path = os.path.join(assert_dir, "finger_point_idx/{}.txt".format(finger))
             point_idx = np.loadtxt(idx_path).astype(np.int32)
-            hand_finger_indices[finger_name] = torch.from_numpy(point_idx).long()
+            hand_finger_indices[finger] = torch.from_numpy(point_idx).long().to(self.device)
         return hand_segment_indices, hand_finger_indices
 
     def recover_points_batch(self, vertices):
@@ -120,7 +146,7 @@ class ManoHandLayer(torch.nn.Module):
         # point_coord = TENSOR[1, 32, 3]
         batch_size = vertices.shape[0]
         batch_idx = torch.arange(batch_size)[:, None, None]  # TENSOR[NBATCH, 1, 1]
-        indexed_vertices = vertices[batch_idx, self.face_vert_idx, :]  # TENSOR[NBATCH, 32, 3, 3]
+        indexed_vertices = vertices[batch_idx, self.face_vert_idx, :]  # TENSOR[NBATCH, n, 3, 3]
 
         faces_normals = torch.cross(
             indexed_vertices[:, :, 2] - indexed_vertices[:, :, 1],
@@ -137,12 +163,12 @@ class ManoHandLayer(torch.nn.Module):
                           weights_3 * indexed_vertices[:, :, 2])  # TENSOR[NBATCH, 32, 3]
         return rebuilt_points, faces_normals
 
-    def forward(self, theta):
+    def forward(self, theta, shape):
         """
         Args:
             theta (Tensor (batch_size x 45)): The degrees of freedom of the Robot hand.
        """
-        ret = self.chain(theta)
+        ret = self.chain(theta, shape)
         return ret
 
     def compute_abnormal_joint_loss(self, theta):
@@ -150,19 +176,19 @@ class ManoHandLayer(torch.nn.Module):
         T_g_p = self.transforms_abs  # (B, 16, 4, 4)
         T_g_a, R, ee = self.axisFK(T_g_p)  # ee (B, 16, 3)
 
-        loss = self.anatomyLoss(ee).sum(dim=-1) * 8.0
+        loss = self.anatomyLoss(ee).sum(dim=-1) * 7.0
         return loss
 
     def get_init_angle(self):
-        # init_angle = torch.tensor([1.4652, -0.3323, -0.0870,  0.7658, -0.2669, -0.4410,  0.3247, -0.0949, -0.7999,
-        #                            -0.6839, -0.8696, -0.3359, -1.2978,  0.6732, -1.0504, -1.1258, 1.1044, -0.2957,
-        #                            0.6644,  2.4779, -2.1917,  0.2846, -1.3454, -2.0336, 3.0933],
-        #                           dtype=torch.float, device=self.device)
+        init_angle = torch.tensor([1.4652, -0.3323, -0.0870,  0.7658, -0.2669, -0.4410,  0.3247, -0.0949, -0.7999,
+                                   -0.6839, -0.8696, -0.3359, -1.2978,  0.6732, -1.0504, -1.1258, 1.1044, -0.2957,
+                                   0.6644,  2.4779, -2.1917,  0.2846, -1.3454, -2.0336, 3.0933],
+                                  dtype=torch.float, device=self.device)
         # init_angle = torch.tensor([1.4821, -0.4207, -0.0099,  0.9950, -0.1108, -0.0120,  0.2900, -0.2656,
         #  -0.2779, -0.4557, -0.6208, -0.6137, -0.6571,  0.9211, -0.4979, -0.2437,
         #   2.2343,  0.1720, -0.2148,  1.7550], dtype=torch.float32, device=self.device)
-        init_angle = torch.zeros(self.n_dofs, dtype=torch.float, device=self.device)
-        init_angle[36:39] = torch.tensor([1.2, 0.4, 0.2])
+        # init_angle = torch.zeros(self.n_dofs, dtype=torch.float, device=self.device)
+        # init_angle[36:39] = torch.tensor([1.2, 0.4, 0.2])
         return init_angle
 
     def get_hand_mesh(self, pose, ret):
@@ -173,29 +199,105 @@ class ManoHandLayer(torch.nn.Module):
         for idx in range(bs):
             verts = output_verts[idx]
             faces = self.chain.get_mano_closed_faces()
-            vertex_colors = np.array([[0, 255, 255]]).repeat(778, 0)
+            # Light Skin:
+            # RGB: (255, 228, 196)
+            # Medium Skin:
+            # RGB: (224, 172, 105)
+            # Dark Skin:
+            # RGB: (138, 85, 51)
+            vertex_colors = np.array([[255, 224, 189]]).repeat(778, 0)
 
             hand_mesh = trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=faces.numpy(),
                                         vertex_colors=vertex_colors)
             hand_meshes.append(hand_mesh)
         return hand_meshes
 
-    def get_forward_hand_mesh(self, pose, theta):
+    def get_forward_hand_mesh(self, pose, theta, shape=None, return_mano_output=False, transform_wrt_center_joint=True):
         theta_all = torch.cat([self.zero_root.repeat(theta.shape[0], 1), theta], dim=1)
-        outputs = self.forward(theta_all)
+        outputs = self.forward(theta_all, shape)
+        self.transforms_abs = outputs.transforms_abs.clone()
 
         hand_meshes = self.get_hand_mesh(pose, outputs)
+        if return_mano_output:
+            if not transform_wrt_center_joint:
+                verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+                joints = (pose[:, :3, :3] @ outputs.joints.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+                center_joint = (pose[:, :3, :3] @ outputs.center_joint.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+                full_poses = outputs.full_poses
+                full_poses[:, :3] = roma.rotmat_to_rotvec(pose[:, :3, :3])
+                outputs = MANOOutput(
+                    verts=verts,
+                    joints=joints,
+                    center_idx=outputs.center_idx,
+                    center_joint=center_joint,
+                    full_poses=full_poses,
+                    betas=outputs.betas,
+                    transforms_abs=outputs.transforms_abs,
+                )
+            return hand_meshes, outputs
+        else:
 
-        return hand_meshes
+            return hand_meshes
 
-    def get_forward_vertices(self, pose, theta):
+    def get_forward_vertices(self, pose, theta, shape=None, return_mano_output=False, transform_wrt_center_joint=True):
         theta_all = torch.cat([self.zero_root.repeat(theta.shape[0], 1), theta], dim=1)
-        outputs = self.forward(theta_all)
-        self.transforms_abs = outputs.transforms_abs
-        verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
-        points, normals = self.recover_points_batch(verts)
+        outputs = self.forward(theta_all, shape)
+        self.transforms_abs = outputs.transforms_abs.clone()
+        if return_mano_output:
+            verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+            points, normals = self.recover_points_batch(verts)
+            if not transform_wrt_center_joint:
+                joints = (pose[:, :3, :3] @ outputs.joints.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+                center_joint = (pose[:, :3, :3] @ outputs.center_joint.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+                full_poses = outputs.full_poses
+                full_poses[:, :3] = roma.rotmat_to_rotvec(pose[:, :3, :3])
+                outputs = MANOOutput(
+                    verts=verts,
+                    joints=joints,
+                    center_idx=outputs.center_idx,
+                    center_joint=center_joint,
+                    full_poses=full_poses,
+                    betas=outputs.betas,
+                    transforms_abs=outputs.transforms_abs,
+                )
+            return points, normals, outputs
+        else:
+            verts = (pose[:, :3, :3] @ outputs.verts.transpose(1, 2) + pose[:, :3, 3:4]).transpose(1, 2)
+            points, normals = self.recover_points_batch(verts)
+            return points, normals
 
-        return points, normals
+    def get_bul_axes_glb(self, mano_results):
+        T_g_p = mano_results.transforms_abs  # (B, 16, 4, 4)
+        T_g_a, _, _ = self.axisFK(T_g_p)  # ee (B, 16, 3)
+
+        # bul_axes_glb = torch.matmul(pose, T_g_a)  # (B, 16, 4, 4)
+        bul_axes_glb = torch.matmul(T_g_a, self.lTm)
+        '''
+        #  transform order (right hand)
+        #         15-14-13-\
+        #                   \
+        #    3-- 2 -- 1 -----0   
+        #   6 -- 5 -- 4 ----/
+        #   12 - 11 - 10 --/
+        #    9-- 8 -- 7 --/
+        # ** original MANO joint order (right hand)
+        #                16-15-14-13-\
+        #                             \
+        #          17 --3 --2 --1------0
+        #        18 --6 --5 --4-------/
+        #        19 -12 -11 --10-----/
+        #          20 --9 --8 --7---/
+        # manotorch joint order (right hand)
+        #                   4-3-2-1-\
+        #                            \
+        #          8 --7 --6 --5------0
+        #     12 --11 --10 --9-------/
+        #       16 -15 -14 --13-----/
+        #        20--19 --18--17---/
+        '''
+        # fingertip_pose = bul_axes_glb[:, [15, 3, 6, 12, 9]].clone()  # order in [thumb, index, middle, ring, little]
+        # fingertip_pose[:, :, :3, 3] = joint_pos[:, [4, 8, 12, 16, 20]].clone()  # order in [thumb, index, middle, ring, little]
+        return bul_axes_glb
 
 
 class ManoAnchor(torch.nn.Module):
@@ -281,15 +383,17 @@ if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    show_mesh = False
+    show_mesh = True
     to_mano_frame = True
     hand = ManoHandLayer(show_mesh=show_mesh, to_mano_frame=to_mano_frame, device=device)
 
-    pose = torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).float()
+    # pose = torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).float()
+    pose = torch.from_numpy(trimesh.transformations.random_rotation_matrix()).to(device).reshape(-1, 4, 4).float()
     theta = np.zeros((1, hand.n_dofs), dtype=np.float32)
     # theta[0, 12:17] = np.array([-0.5, 0.5, 0, 0, 0])
     theta = torch.from_numpy(theta).to(device)
-    theta[:, 36:39] = torch.FloatTensor([1.2, 0.4, 0.2])
+    random_shapes = torch.rand(1, 10).to(device)
+    # theta[:, 36:39] = torch.FloatTensor([1.2, 0.4, 0.2])
     # theta[:, 18:27] = torch.FloatTensor([-0.0,  0.0,  0.0, 0, 1.0, 1.0, 0, 1.5, 1.0])
     # limit_middlefinger_right = torch.FloatTensor([-2.9802e-08, -7.4506e-09, 1.4932e+00])  # 9:12
     # print(hand.joints_lower)
@@ -299,13 +403,18 @@ if __name__ == "__main__":
 
     # mesh version
     if show_mesh:
-        mesh = hand.get_forward_hand_mesh(pose, theta)[0]
-        mesh.show()
-        mesh.export('../assets/hand_to_mano_frame.obj')
+        mesh, mano_output = hand.get_forward_hand_mesh(pose, theta, random_shapes, return_mano_output=True)
+        # mesh[0].show()
+        # mesh[0].export('../assets/hand_to_mano_frame.obj')
+        fingertip_pose = hand.get_bul_axes_glb(mano_output, pose)
+        axes = []
+        for pose in fingertip_pose[0]:
+            axes.append(trimesh.creation.axis(origin_size=0.001, transform=pose.cpu().numpy(), axis_radius=0.001, axis_length=0.015))
+        scene = trimesh.Scene([*axes, mesh[0]])
+        scene.show()
     else:
         # hand_segment_indices, hand_finger_indices = hand.get_hand_segment_indices()
-        verts, normals = hand.get_forward_vertices(pose, theta)
-        print(verts.shape)
+        verts, normals, mano_output = hand.get_forward_vertices(pose, theta,  return_mano_output=True)
 
         pc_list = []
         for finger_name in ['palm', 'thumb', 'index', 'middle', 'ring', 'little']:
