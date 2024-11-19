@@ -65,11 +65,11 @@ class ManoHandLayer(torch.nn.Module):
         if use_pca:
             self.n_dofs = 25  # ncomps
             if to_mano_frame:
-                self.chain = ManoLayer(use_pca=True, center_idx=9, ncomps=self.n_dofs, flat_hand_mean=False).to(
+                self.chain = ManoLayer(use_pca=True, center_idx=9, ncomps=self.n_dofs, flat_hand_mean=flat_hand_mean).to(
                     self.device)
                 # self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
             else:
-                self.chain = ManoLayer(use_pca=True, center_idx=0, ncomps=self.n_dofs, flat_hand_mean=False).to(
+                self.chain = ManoLayer(use_pca=True, center_idx=0, ncomps=self.n_dofs, flat_hand_mean=flat_hand_mean).to(
                     self.device)
                 # self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
 
@@ -81,11 +81,11 @@ class ManoHandLayer(torch.nn.Module):
         else:
             self.n_dofs = 45
             if to_mano_frame:
-                self.chain = ManoLayer(use_pca=False, center_idx=9, flat_hand_mean=False).to(
+                self.chain = ManoLayer(use_pca=False, center_idx=9, flat_hand_mean=flat_hand_mean).to(
                     self.device)
                 # self.chain = ManoLayer(center_idx=9, flat_hand_mean=True).to(self.device)
             else:
-                self.chain = ManoLayer(use_pca=False, center_idx=0, flat_hand_mean=False).to(
+                self.chain = ManoLayer(use_pca=False, center_idx=0, flat_hand_mean=flat_hand_mean).to(
                     self.device)
                 # self.chain = ManoLayer(center_idx=0, flat_hand_mean=True).to(self.device)
             self.joints_lower = -2 * torch.ones(self.n_dofs, dtype=torch.float, device=self.device)
@@ -130,13 +130,20 @@ class ManoHandLayer(torch.nn.Module):
 
     def get_hand_segment_indices(self):
         assert_dir = os.path.dirname(os.path.realpath(__file__)) + "/../assets/"
-        # TODO: hand segment idx for mano hand will be released in the next version
         hand_segment_indices = {}
         hand_finger_indices = {}
         for finger in ['palm', 'thumb', 'index', 'middle', 'ring', 'little']:
             idx_path = os.path.join(assert_dir, "finger_point_idx/{}.txt".format(finger))
             point_idx = np.loadtxt(idx_path).astype(np.int32)
             hand_finger_indices[finger] = torch.from_numpy(point_idx).long().to(self.device)
+        for finger in ['palm', 'thumb_f0', 'thumb_f1',
+                       'index_f0', 'index_f1', 'index_f2',
+                       'middle_f0', 'middle_f1', 'middle_f2',
+                       'ring_f0', 'ring_f1', 'ring_f2',
+                       'little_f0', 'little_f1', 'little_f2']:
+            idx_path = os.path.join(assert_dir, "finger_point_idx/{}.txt".format(finger))
+            point_idx = np.loadtxt(idx_path).astype(np.int32)
+            hand_segment_indices[finger] = torch.from_numpy(point_idx).long().to(self.device)
         return hand_segment_indices, hand_finger_indices
 
     def recover_points_batch(self, vertices):
@@ -383,9 +390,9 @@ if __name__ == "__main__":
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    show_mesh = True
+    show_mesh = False
     to_mano_frame = True
-    hand = ManoHandLayer(show_mesh=show_mesh, to_mano_frame=to_mano_frame, device=device)
+    hand = ManoHandLayer(show_mesh=show_mesh, to_mano_frame=to_mano_frame, use_pca=False, flat_hand_mean=True, device=device)
 
     # pose = torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).float()
     pose = torch.from_numpy(trimesh.transformations.random_rotation_matrix()).to(device).reshape(-1, 4, 4).float()
@@ -415,7 +422,7 @@ if __name__ == "__main__":
     else:
         # hand_segment_indices, hand_finger_indices = hand.get_hand_segment_indices()
         verts, normals, mano_output = hand.get_forward_vertices(pose, theta,  return_mano_output=True)
-
+        print(verts.shape)
         pc_list = []
         for finger_name in ['palm', 'thumb', 'index', 'middle', 'ring', 'little']:
             finger_indices = hand.hand_finger_indices[finger_name]
@@ -428,12 +435,12 @@ if __name__ == "__main__":
                                                      verts[0].detach().cpu().numpy() +
                                                      normals[0].detach().cpu().numpy() * 0.01)).reshape(-1, 2, 3))
 
-        mesh = trimesh.load(os.path.join(hand.BASE_DIR, '../assets/hand_to_mano_frame.obj'))
+        # mesh = trimesh.load(os.path.join(hand.BASE_DIR, '../assets/hand_to_mano_frame.obj'))
 
         anchor_layer = ManoAnchor()
         # anchor_layer.pick_points(verts.squeeze().cpu().numpy())
         anchors = anchor_layer(verts).squeeze().cpu().numpy()
         pc_anchors = trimesh.PointCloud(anchors[:46], colors=(255, 0, 255))
 
-        scene = trimesh.Scene([*pc_list, ray_visualize])
+        scene = trimesh.Scene([*pc_list, pc_anchors, ray_visualize])
         scene.show()
